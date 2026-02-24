@@ -1,0 +1,35 @@
+---
+description: Modular project structure — tools, agents, workflows, entrypoints
+alwaysApply: true
+---
+
+# Project Structure (Modularity)
+
+Apply this convention whenever adding or refactoring agent features in this project.
+
+## Layout
+
+- **Tools** live in `src/tools/` — one file per domain (e.g. `market_tools.py`, `mongo_rag.py`). Define tools with LangChain `@tool`. Re-export from `src/tools/__init__.py`.
+- **Agents** live in `src/agents/` — factory functions that return **compiled** LangGraph graphs (e.g. `StateGraph(...).compile()` or `create_react_agent`). One file per family (e.g. `market_agents.py`). Re-export from `src/agents/__init__.py`.
+- **Workflows** live in `src/workflows/` — orchestration logic (parallel/sequential steps). Expose each workflow as a single `@tool` so the main entrypoint can register it. Re-export from `src/workflows/__init__.py`.
+- **Entrypoints** stay at `src/` root (e.g. `main.py`). Do not add new entrypoint files; extend the existing one by importing and registering new tools/workflows.
+
+## LangChain tool conventions
+
+- Use the `@tool` decorator from `langchain.tools` (or `langchain_core.tools`). Provide a **clear docstring**: the LLM uses it to decide when and how to call the tool.
+- For richer metadata use `@tool(parse_docstring=True)` and document **Args** (name, type, meaning) in the docstring.
+- Pass tools to the agent as a list (e.g. `tools=[search, get_weather]`). The entrypoint can combine in-code tools with MCP tools.
+
+## LangGraph agent conventions
+
+- **State**: Use `MessagesState` (or a custom `TypedDict`) for chat-style agents. State is the single shared object read/updated by nodes.
+- **Graph**: Build with `StateGraph(State)`, add nodes with `add_node`, wire with `add_edge(START, "node_name")`, `add_conditional_edges(...)`, and `add_edge("node", END)`. Call `.compile(checkpointer=...)` for persistence.
+- **ReAct-style loop**: Typical pattern: node `llm_call` → conditional edge (tool_calls? → `tool_node` → back to `llm_call`, else `END`). Use `add_conditional_edges("llm_call", should_continue, ["tool_node", END])` and `add_edge("tool_node", "llm_call")`.
+- **Factory**: Each agent type should be a function that returns a **compiled** graph (e.g. `def create_xyz_agent(llm, tools) -> CompiledGraph`) so the entrypoint can invoke it with `graph.ainvoke({"messages": [...]}, config=config)`.
+- **Async when using tools**: If a node (or a subgraph it calls) invokes MCP or async tools, that node must be **async** and use `await tool.ainvoke(...)`; the graph should use `ainvoke` for the whole run (e.g. `graph.ainvoke(...)`, `await subgraph.ainvoke(...)` from an async parent node). See agentcore-development rules for tool param and result-handling details.
+
+## Rules
+
+- When adding a new tool, add it in the appropriate file under `src/tools/` and add it to `src/tools/__init__.py`.
+- When adding a new agent type, add a factory in `src/agents/` that returns a compiled graph and re-export it.
+- When adding a new multi-step workflow, implement it under `src/workflows/` and expose one `@tool` that the main agent can call; then register that tool in `src/main.py`.

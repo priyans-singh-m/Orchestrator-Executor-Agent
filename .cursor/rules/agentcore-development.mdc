@@ -1,0 +1,107 @@
+---
+description: AgentCore CLI, agents, MCP, memory, tools, A2A — local and cloud deployment
+alwaysApply: true
+---
+
+# AgentCore Development Rules
+
+Apply these whenever working on agents, AgentCore CLI, MCP, memory, tools, or deployment in this project.
+
+## AgentCore CLI
+
+- **Configure**: `agentcore configure -e <entrypoint> -n <agent_name>` (e.g. `-e src/main.py`). Use for deployment type, region, and service options.
+- **Local run**: `agentcore launch --local` or `agentcore launch -l` (requires Docker/Finch/Podman). Use for local dev and testing.
+- **Cloud deploy**: `agentcore launch` (CodeBuild, no Docker). Use `agentcore launch --local-build` to build locally then deploy.
+- **Env vars**: Pass with `-env`, e.g. `agentcore launch -l -env MCP_SERVER_URL=$MCP_SERVER_URL -env OPENAI_API_KEY=sk-...`
+- **Invoke**: `agentcore invoke '{"prompt":"..."}'` for cloud; add `-l` or `--local` for local. Use `--session-id` for memory/session.
+- **Local dev server**: `agentcore dev` starts the agent locally (no deploy). Then use **Postman or any HTTP client** to chat: `POST http://localhost:8080/invocations` with body `{"prompt": "..."}` (or full thread for context). Alternative: in another terminal `agentcore invoke --dev "Hello!"`. Prefer `agentcore dev` + Postman when you want to try different payloads (e.g. sending full message history) without deploying.
+- **Other**: `agentcore status` to monitor; `agentcore destroy` to remove deployed resources.
+- **Direct run**: `python src/main.py` or `uv run src/main.py` then `curl -X POST http://localhost:8080/invocations -H "Content-Type: application/json" -d '{"prompt":"Hello!"}'` or `curl http://localhost:8080/ping`.
+
+## Creating Agents (LangChain / LangGraph + AgentCore)
+
+- Use `BedrockAgentCoreApp()` from `bedrock_agentcore` (or `bedrock_agentcore.runtime`).
+- Single entrypoint: one function decorated with `@app.entrypoint`. It receives `payload` (e.g. `payload.get("prompt")`) and returns a dict or simple value.
+- Entrypoint can be sync or async; invoke the agent (e.g. `graph.ainvoke(...)` / `graph.invoke(...)`) and return the result (e.g. last message content from `result["messages"][-1].content`).
+- Always use `if __name__ == "__main__": app.run()` so the runtime controls the process.
+- Agent config lives in `.bedrock_agentcore.yaml` (entrypoint, source_path, deployment_type, runtime_type, memory, identity, etc.). Prefer `agentcore configure` to change high-level options; edit YAML only when needed for fine-grained settings.
+
+### LangChain vs LangGraph (when to use which)
+
+- **LangChain agents** (`create_agent` from `langchain.agents`): Higher-level, pre-built ReAct-style loop. Good for simple tool-calling agents with minimal custom flow. Pass `llm`, `tools`, optional `checkpointer`; invoke with `{"messages": [...]}`.
+- **LangGraph**: Low-level, stateful orchestration. Use when you need custom nodes, conditional routing, human-in-the-loop, durable execution, or explicit control over the graph. Build with `StateGraph(MessagesState)`, add nodes (e.g. `llm_call`, `tool_node`), add edges and conditional edges, then `graph = builder.compile(checkpointer=...)`. Invoke with `graph.ainvoke({"messages": [...]}, config=config)` where `config["configurable"]["thread_id"]` is set for checkpointing.
+
+### LangGraph architecture (patterns from docs)
+
+- **State**: Define a state schema (e.g. `MessagesState` or custom `TypedDict`). Each node receives state and returns a partial update (e.g. `{"messages": [new_message]}`).
+- **Nodes**: Discrete steps—e.g. LLM call (with `llm.bind_tools(tools).invoke(messages)`), tool execution, or data retrieval. Use `builder.add_node("name", node_function)`.
+- **Edges**: `add_edge(START, "first_node")`, `add_edge("node_a", "node_b")`, `add_edge("last_node", END)`. Use `add_conditional_edges("node", should_continue_fn, ["next_a", "next_b", END])` for routing (e.g. ReAct: continue to tool_node or END based on `tool_calls`).
+- **Compile with checkpointer**: For session persistence (e.g. MongoDB or `InMemorySaver`), pass `checkpointer` to `compile(checkpointer=checkpointer)`. Then pass `config={"configurable": {"thread_id": session_id}}` on invoke so the same thread resumes.
+- **Durable execution**: Use a checkpointer (e.g. `langgraph-checkpoint-mongodb`) so agents can resume after failures; pair with `thread_id` from payload/session for continuity.
+
+## Session and conversation context (critical)
+
+- **The agent has no built-in memory across invokes.** It only sees what is sent in the **current request**. Same `sessionId` does **not** mean the agent sees prior messages; it only associates the request with a session (e.g. for AgentCore Memory or routing).
+- **To get “memory” you must either:**
+  1. **Send the full thread in each invoke**: Include prior user/assistant messages in the payload (e.g. `payload.messages` or `payload.history`) and have the entrypoint pass them to the graph so each invoke receives the full conversation, or
+  2. **Use AgentCore Memory**: Enable and configure memory in `.bedrock_agentcore.yaml`, and in the entrypoint load/store messages by session (via SDK/API) so the graph receives history from memory instead of only the current prompt, or
+  3. **Use a LangGraph checkpointer** (e.g. MongoDB or InMemorySaver): Compile the graph with `checkpointer=...` and pass `config={"configurable": {"thread_id": session_id}}` on every `graph.ainvoke(..., config=config)`. Use a stable `thread_id` per conversation (e.g. from `payload.get("sessionId")`). The graph then resumes from checkpointed state for that thread.
+- **If the client sends only `{"prompt": "..."}` with no history**, the agent will never see previous turns—unless the graph uses a checkpointer and the entrypoint passes the same `thread_id` for that session.
+- When debugging “agent forgot context,” check: (1) Is the full thread being sent in the payload? (2) Is the entrypoint forwarding that thread to the graph? (3) If using a checkpointer, is `thread_id` set in `config` and consistent per session?
+- When suggesting invoke usage or entrypoint logic, remind about this when conversation continuity or session memory is relevant.
+
+## Memory (AgentCore)
+
+- Memory is configured in `.bedrock_agentcore.yaml` under `agents.<name>.memory` (mode, memory_id, memory_arn, memory_name, event_expiry_days).
+- **sessionId**: `--session-id` on invoke ties the request to a session but does **not** send prior messages to the agent; use it together with either client-sent thread or AgentCore Memory for continuity.
+- **Local**: Memory behavior may be emulated or limited; use `--session-id` to test session-scoped memory when memory is enabled or when the client sends full thread.
+- **Cloud**: Set `memory.mode` and related fields (e.g. after creating memory via AWS/CLI). Ensure IAM and runtime have access to the memory resource.
+- When adding or changing memory, document whether the change is for local testing only or for cloud deployment and update the rule or README if it affects how to run/invoke.
+
+## MongoDB Atlas as memory (short-term + long-term)
+
+- **AgentCore does not have a “MongoDB memory” config.** Use MongoDB in our agent code for custom memory; keep `.bedrock_agentcore.yaml` memory as NO_MEMORY if using only MongoDB.
+- **Short-term (conversation per session):** Use LangGraph’s **MongoDB checkpointer** so each session’s message history is persisted. Install `langgraph-checkpoint-mongodb`, use `AsyncMongoDBSaver.from_conn_string(MONGO_URI)` (or `MongoDBSaver` for sync), compile the graph with `checkpointer=checkpointer`. In the entrypoint, pass `session_id` from payload (or a stable thread key) as `config["configurable"]["thread_id"]` when calling `graph.ainvoke(..., config=config)` so the same session resumes from MongoDB. Use Atlas or any MongoDB; connection string in env (e.g. `MONGODB_URI`).
+- **Long-term (cross-session facts/summaries):** Use **MongoDB Atlas Vector Search**. Create a dedicated collection and a vector search index on the embedding field (e.g. `numDimensions`: 1536 or 1024 to match your embedding model, `similarity`: `cosine`). Use `langchain_mongodb.vectorstores.MongoDBAtlasVectorSearch` with `from_connection_string(connection_string, namespace="db.collection", embedding=... , index_name="vector_index")`. In the entrypoint (or a graph node): (1) Retrieve relevant memories with `vector_store.as_retriever().invoke(current_query)` and inject into system/context; (2) Optionally write new facts/summaries (e.g. after turns) by adding documents with embeddings. Requires an embedding model (e.g. Voyage, OpenAI) and env for `MONGODB_URI`.
+- **Local vs cloud:** Use the same `MONGODB_URI` for both; ensure Atlas network access allows the runtime (e.g. cloud: allow AWS IPs or VPC peering). Do not commit URIs; pass via env or AgentCore config.
+
+## Tools
+
+- **In-code tools**: Define with LangChain `@tool` (or LangGraph equivalents). Use clear docstrings and, if needed, `parse_docstring=True` with **Args** so the LLM can choose and call tools correctly. Pass tools to the agent/graph in the entrypoint (e.g. combine MCP tools with local `[add_numbers, ...]`).
+- **Local**: All in-process tools work as-is when running via `agentcore launch -l` or `python src/main.py`.
+- **Cloud**: Same code is deployed; ensure any tool dependencies (env vars, network) are configured for the cloud runtime (e.g. via `agentcore launch -env ...` or IAM/security groups).
+
+### Tools: async, params, and result handling (MCP / LangChain)
+
+- **Async only for MCP tools**: LangChain MCP adapters expose tools that support **async invocation only**. Use `await tool.ainvoke(...)` when calling from our code. Using sync `tool.invoke(...)` can raise "StructuredTool does not support sync invocation." Any **node or data_fetcher that calls MCP tools** must be **async** and use `await`; the graph must call that node via `ainvoke` (e.g. `await subgraph.ainvoke(...)` from an async orchestrator node).
+- **Tool parameters are per-tool**: Each MCP tool has its own required/optional args. Do not assume one param name (e.g. `query`) for all tools. Check the tool schema or descriptor (e.g. in MCP server docs or `mcps/<server>/tools/*.json`) before calling. Example: `web_search_exa` expects `query`; `company_research_exa` expects `companyName`; `deep_researcher_start` expects `instructions`. Passing the wrong key leads to validation errors.
+- **Result type: list or dict**: External tools (e.g. Exa) may return a **list** (e.g. search results) or a **dict** (e.g. `{ "results": [...] }` or `{ "summary": "..." }`). Never call `.get()` on the raw result without checking type—calling `.get()` on a list raises `'list' object has no attribute 'get'`. Use a small helper that: if `isinstance(result, list)`, iterate and format items (e.g. extract `text`/`content`/`title` from dict items, join with newlines); if `isinstance(result, dict)`, read `summary`/`text`/`content`/`results` and, if that value is again list/dict, recurse or format so the final output is a single string. This keeps downstream nodes (e.g. synthesizer, strategist) safe.
+
+## Orchestrator, nodes, and LLM usage
+
+- **LLMs at nodes, not one global agent**: LLMs are wired **per node** where reasoning or generation is needed. Use factory functions like `create_supervisor_node(llm)`, `create_scout_node(llm, data_fetcher)`, `create_strategist_node(llm)`, `create_reviewer_node(llm)`. The supervisor uses the LLM to route; the scout may use the LLM only as fallback when the data_fetcher fails; the strategist uses the LLM to turn aggregated data into a report; the reviewer uses the LLM for final review. This keeps each node’s role clear and avoids a single “do everything” agent.
+- **Flow: specialized subgraphs then reviewer**: Orchestrator flow is: **supervisor** (LLM routes to a branch) → **specialized subgraph** (e.g. market_intelligence: scout → synthesizer → strategist) → control returns to the **orchestrator** with the subgraph’s output (e.g. `final_summary`) in state/messages → **reviewer** node runs with full context (all messages plus the specialized output) to do final review/checks → **END**. So the reviewer runs after specialized agents’ jobs are finished and sees their results; it does not run inside the subgraph.
+- **Subgraph invocation**: The node that invokes a specialized subgraph (e.g. market_intelligence) should be async when the subgraph uses async nodes/tools: `await subgraph.ainvoke(mi_input, config=config)` and then merge the result (e.g. append assistant message with `final_summary`) into orchestrator state so the reviewer has access to it.
+
+## MCP (Gateway, Streamable HTTP, etc.)
+
+- **MCP client**: This project uses streamable HTTP MCP (e.g. `MultiServerMCPClient` from `langchain_mcp_adapters`) with transport `"streamable_http"` and a `url`. Support bearer auth via headers when the server requires it.
+- **Local**: Use env vars or `.env.local` for MCP server URL and tokens; pass them when running (e.g. `agentcore launch -l -env MCP_SERVER_URL=... -env MCP_ACCESS_TOKEN=...`). Ensure the MCP server is reachable from the host (localhost or network).
+- **Cloud**: Set the same env vars in the launch command or via AgentCore configuration so the deployed runtime can reach the MCP server (URLs must be reachable from AWS; use VPC/security groups if the server is private).
+- When adding a new MCP server, add its config to the client (e.g. in `src/mcp_client/client.py`) and document required env vars and any local vs cloud differences.
+
+## A2A (Agent-to-Agent) Protocol
+
+- When implementing or calling A2A: follow the official Bedrock AgentCore / AWS docs for the protocol (endpoints, payloads, auth). Prefer SDK or documented patterns over ad-hoc HTTP.
+- For local testing of A2A, ensure the agent is reachable (e.g. local URL or tunnel) and that the other agent is configured with the correct endpoint and credentials.
+- For cloud, use the deployed agent’s public endpoint and the recommended auth (e.g. IAM, API key) as per the docs.
+
+## Local vs Cloud Checklist
+
+- **Local**: `agentcore launch -l` or **`agentcore dev` + Postman/HTTP client** (POST to `http://localhost:8080/invocations`) or `agentcore invoke --dev` or run entrypoint script and curl; use local/env-based secrets and MCP URLs.
+- **Cloud**: `agentcore launch` (or `agentcore launch --local-build`); set production env vars and ensure memory, MCP, and identity are configured for AWS (IAM, VPC, public URLs as needed).
+- When suggesting commands or config changes, state whether they apply to local, cloud, or both and mention any env or YAML updates required.
+
+## Keeping this rule up to date
+
+- When we learn something new about AgentCore functionality (CLI, memory, session context, MCP, A2A, deployment, or SDK behavior), update this rules document with that information as appropriate—add or correct sections, examples, or caveats so future chats have accurate guidance. Prefer concise, actionable bullets.
