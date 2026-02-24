@@ -13,4 +13,4 @@ class GlobalState(TypedDict):
     messages: Annotated[list, add_messages]
     current_query: str
     market_reports: Annotated[list, operator.add]
-    next_node: NotRequired[str]  # set by supervisor for routing
+    next_nodes: NotRequired[list[str]]  # set by supervisor; 1+ nodes run in parallel

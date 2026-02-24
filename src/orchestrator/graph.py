@@ -30,9 +30,10 @@ Given the user message, output a JSON array of 3-6 short research subjects to lo
 - Deal types if mentioned (e.g. "open box deals")
 Use concise labels (a few words each). Output only the JSON array, no other text. Example: ["Sony WH-1000XM5", "competitor pricing", "open box deals"]"""
 
-REVIEWER_SYSTEM = """You are a quality reviewer for an AI assistant. You receive the assistant's reply to the user.
+REVIEWER_SYSTEM = """You are a quality reviewer for an AI assistant. You receive the assistant's reply to the user (possibly combining multiple parts from parallel specialists).
 - If the reply is complete, correct, and well-formatted, return it unchanged (output the reply exactly as-is).
 - If something is missing, wrong, or unclear, return an improved version that fixes the issue while keeping the same intent.
+- If the reply has multiple sections (e.g. from different specialists), keep them coherent and well-ordered; do not drop any important part.
 Output only the final reply to the user, nothing else. No preamble like "Here is the corrected version"."""
 
 
@@ -108,16 +109,29 @@ def create_market_intelligence_node(llm: Any, data_fetcher: Any = None):
 
 
 def create_reviewer_node(llm: Any):
-    """Review the last assistant message; optionally improve it before returning to the user."""
+    """Review assistant reply; when multiple parallel branches ran, combine their outputs into one reply."""
     def reviewer_node(state: GlobalState) -> dict:
         messages = state.get("messages") or []
         logger.info("[Node] reviewer called (messages=%d)", len(messages))
         if not messages:
             return {}
-        last = messages[-1]
-        content = getattr(last, "content", None) or ""
-        if not isinstance(content, str):
-            content = str(content)
+        # Find last human message; collect all assistant content after it (from parallel branches)
+        last_human_idx = -1
+        for i in range(len(messages) - 1, -1, -1):
+            if isinstance(messages[i], HumanMessage):
+                last_human_idx = i
+                break
+        parts = []
+        for i in range(last_human_idx + 1, len(messages)):
+            msg = messages[i]
+            content = getattr(msg, "content", None) or ""
+            if not isinstance(content, str):
+                content = str(content)
+            if content.strip():
+                parts.append(content.strip())
+        content = "\n\n---\n\n".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
+        if not content:
+            return {}
         try:
             response = llm.invoke([
                 SystemMessage(content=REVIEWER_SYSTEM),
@@ -164,11 +178,18 @@ def create_orchestrator_graph(llm, agent_graph, checkpointer=None, data_fetcher=
     builder.add_node("reviewer", create_reviewer_node(llm))
 
     builder.add_edge(START, "supervisor")
-    builder.add_conditional_edges(
-        "supervisor",
-        lambda s: s.get("next_node") or "main_agent",
-        {"market_intelligence": "market_intelligence", "main_agent": "main_agent"},
-    )
+    # Return list of node names so multiple can run in parallel (Option B: true parallel branches).
+    # When adding a new domain: add_node(...), add_edge("new_domain", "reviewer"), and add to VALID_NEXT_NODES in supervisor.
+    def supervisor_next(state):
+        nodes = state.get("next_nodes") or ["main_agent"]
+        if not isinstance(nodes, list):
+            nodes = [nodes] if nodes else ["main_agent"]
+        # Only allow known nodes (same set as in supervisor.VALID_NEXT_NODES)
+        valid = {"market_intelligence", "main_agent"}
+        out = [n for n in nodes if n in valid]
+        return out if out else ["main_agent"]
+
+    builder.add_conditional_edges("supervisor", supervisor_next)
     builder.add_edge("market_intelligence", "reviewer")
     builder.add_edge("main_agent", "reviewer")
     builder.add_edge("reviewer", END)
